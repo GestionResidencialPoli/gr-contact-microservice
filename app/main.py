@@ -1,26 +1,33 @@
+import hmac
+import os
+from collections.abc import Generator
 from datetime import UTC, datetime
 from enum import Enum
-import os
-from typing import Generator
 
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
-from sqlalchemy import DateTime, Enum as SqlEnum, ForeignKey, String, Text, create_engine, select
+from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, select
+from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://gr_user:gr_password@localhost:5432/gr_contact_db")
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
 
+
 class Base(DeclarativeBase):
     pass
+
 
 class ContactStatus(str, Enum):
     NUEVA = "NUEVA"
     EN_REVISION = "EN_REVISION"
     RESPONDIDA = "RESPONDIDA"
     CERRADA = "CERRADA"
+
 
 class ContactRequest(Base):
     __tablename__ = "contact_requests"
@@ -31,27 +38,37 @@ class ContactRequest(Base):
     mensaje: Mapped[str] = mapped_column(Text)
     consentimiento_version: Mapped[str] = mapped_column(String(40))
     consentimiento_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    status: Mapped[ContactStatus] = mapped_column(SqlEnum(ContactStatus, name="contact_status"), default=ContactStatus.NUEVA)
+    status: Mapped[ContactStatus] = mapped_column(
+        SqlEnum(ContactStatus, name="contact_status"), default=ContactStatus.NUEVA
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC)
+    )
     history: Mapped[list["ContactStatusHistory"]] = relationship(back_populates="request", cascade="all, delete-orphan")
+
 
 class ContactStatusHistory(Base):
     __tablename__ = "contact_status_history"
     id: Mapped[int] = mapped_column(primary_key=True)
     request_id: Mapped[int] = mapped_column(ForeignKey("contact_requests.id", ondelete="CASCADE"))
-    from_status: Mapped[ContactStatus | None] = mapped_column(SqlEnum(ContactStatus, name="contact_status", create_type=False), nullable=True)
+    from_status: Mapped[ContactStatus | None] = mapped_column(
+        SqlEnum(ContactStatus, name="contact_status", create_type=False), nullable=True
+    )
     to_status: Mapped[ContactStatus] = mapped_column(SqlEnum(ContactStatus, name="contact_status", create_type=False))
     changed_by_user_id: Mapped[int | None] = mapped_column(nullable=True)
     changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     request: Mapped[ContactRequest] = relationship(back_populates="history")
 
+
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
-def get_db() -> Generator[Session, None, None]:
+
+def get_db() -> Generator[Session]:
     with SessionLocal() as db:
         yield db
+
 
 class ContactCreate(BaseModel):
     nombre: str = Field(min_length=2, max_length=120)
@@ -69,6 +86,7 @@ class ContactCreate(BaseModel):
             raise ValueError("El valor no puede estar vacío")
         return value
 
+
 class ContactResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -82,8 +100,10 @@ class ContactResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+
 class StatusChange(BaseModel):
     status: ContactStatus
+
 
 def current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
@@ -97,23 +117,71 @@ def current_user(request: Request) -> dict:
         raise HTTPException(status_code=403, detail={"code": "SIN_PERMISOS", "message": "Se requiere administración"})
     return claims
 
+
+def require_csrf(request: Request) -> None:
+    cookie = request.cookies.get("XSRF-TOKEN")
+    header = request.headers.get("X-XSRF-TOKEN")
+    if not cookie or not header or not hmac.compare_digest(cookie, header):
+        raise HTTPException(status_code=403, detail={"code": "CSRF_INVALIDO", "message": "Token CSRF inválido"})
+
+
 app = FastAPI(title="GR Contact Microservice", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3006,http://localhost:3001").split(","), allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "X-XSRF-TOKEN", "X-Correlation-Id"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3006,http://localhost:3001").split(","),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["Content-Type", "X-XSRF-TOKEN", "X-Correlation-Id"],
+)
+
+
+@app.exception_handler(HTTPException)
+async def http_error(_: Request, exc: HTTPException) -> JSONResponse:
+    detail = exc.detail if isinstance(exc.detail, dict) else {"code": "ERROR_HTTP", "message": str(exc.detail)}
+    return JSONResponse(status_code=exc.status_code, content={"error": detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    details = [
+        {"path": ".".join(str(part) for part in error["loc"]), "message": error["msg"]} for error in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "SOLICITUD_INVALIDA", "message": "Revisa los datos enviados", "details": details}},
+    )
+
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
 
 @app.get("/health/ready")
 def readiness(db: Session = Depends(get_db)) -> dict[str, str]:
     db.execute(select(1))
     return {"status": "ready"}
 
+
 @app.post("/api/v1/contacto/solicitudes", response_model=ContactResponse, status_code=status.HTTP_201_CREATED)
 def create_contact(payload: ContactCreate, db: Session = Depends(get_db)) -> ContactRequest:
     if not payload.consentimiento:
-        raise HTTPException(status_code=422, detail={"code": "CONSENTIMIENTO_REQUERIDO", "message": "Debes aceptar el consentimiento para enviar el mensaje"})
-    item = ContactRequest(nombre=payload.nombre, email=str(payload.email).lower(), telefono=payload.telefono.strip() if payload.telefono else None, mensaje=payload.mensaje, consentimiento_version=payload.consentimiento_version, consentimiento_at=datetime.now(UTC), status=ContactStatus.NUEVA)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "CONSENTIMIENTO_REQUERIDO",
+                "message": "Debes aceptar el consentimiento para enviar el mensaje",
+            },
+        )
+    item = ContactRequest(
+        nombre=payload.nombre,
+        email=str(payload.email).lower(),
+        telefono=payload.telefono.strip() if payload.telefono else None,
+        mensaje=payload.mensaje,
+        consentimiento_version=payload.consentimiento_version,
+        consentimiento_at=datetime.now(UTC),
+        status=ContactStatus.NUEVA,
+    )
     db.add(item)
     db.flush()
     db.add(ContactStatusHistory(request_id=item.id, from_status=None, to_status=ContactStatus.NUEVA))
@@ -121,29 +189,50 @@ def create_contact(payload: ContactCreate, db: Session = Depends(get_db)) -> Con
     db.refresh(item)
     return item
 
+
 @app.get("/api/v1/contacto/solicitudes", response_model=list[ContactResponse])
-def list_contacts(status_filter: ContactStatus | None = Query(default=None, alias="status"), _: dict = Depends(current_user), db: Session = Depends(get_db)) -> list[ContactRequest]:
+def list_contacts(
+    status_filter: ContactStatus | None = Query(default=None, alias="status"),
+    _: dict = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[ContactRequest]:
     query = select(ContactRequest).order_by(ContactRequest.created_at.desc())
     if status_filter:
         query = query.where(ContactRequest.status == status_filter)
     return list(db.scalars(query).all())
 
+
 @app.get("/api/v1/contacto/solicitudes/{request_id}", response_model=ContactResponse)
 def get_contact(request_id: int, _: dict = Depends(current_user), db: Session = Depends(get_db)) -> ContactRequest:
     item = db.get(ContactRequest, request_id)
     if item is None:
-        raise HTTPException(status_code=404, detail={"code": "SOLICITUD_NO_ENCONTRADA", "message": "Solicitud no encontrada"})
+        raise HTTPException(
+            status_code=404, detail={"code": "SOLICITUD_NO_ENCONTRADA", "message": "Solicitud no encontrada"}
+        )
     return item
 
+
 @app.patch("/api/v1/contacto/solicitudes/{request_id}/estado", response_model=ContactResponse)
-def change_status(request_id: int, payload: StatusChange, user: dict = Depends(current_user), db: Session = Depends(get_db)) -> ContactRequest:
+def change_status(
+    request_id: int,
+    payload: StatusChange,
+    user: dict = Depends(current_user),
+    _: None = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> ContactRequest:
     item = db.get(ContactRequest, request_id)
     if item is None:
-        raise HTTPException(status_code=404, detail={"code": "SOLICITUD_NO_ENCONTRADA", "message": "Solicitud no encontrada"})
+        raise HTTPException(
+            status_code=404, detail={"code": "SOLICITUD_NO_ENCONTRADA", "message": "Solicitud no encontrada"}
+        )
     previous = item.status
     item.status = payload.status
     item.updated_at = datetime.now(UTC)
-    db.add(ContactStatusHistory(request_id=item.id, from_status=previous, to_status=payload.status, changed_by_user_id=user.get("uid")))
+    db.add(
+        ContactStatusHistory(
+            request_id=item.id, from_status=previous, to_status=payload.status, changed_by_user_id=user.get("uid")
+        )
+    )
     db.commit()
     db.refresh(item)
     return item
