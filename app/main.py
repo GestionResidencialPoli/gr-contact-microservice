@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from enum import Enum
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, select
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+from app.mailer import ContactNotification, send_contact_notification
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://gr_user:gr_password@localhost:5432/gr_contact_db")
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
@@ -164,7 +166,9 @@ def readiness(db: Session = Depends(get_db)) -> dict[str, str]:
 
 
 @app.post("/api/v1/contacto/solicitudes", response_model=ContactResponse, status_code=status.HTTP_201_CREATED)
-def create_contact(payload: ContactCreate, db: Session = Depends(get_db)) -> ContactRequest:
+def create_contact(
+    payload: ContactCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)
+) -> ContactRequest:
     if not payload.consentimiento:
         raise HTTPException(
             status_code=422,
@@ -187,6 +191,17 @@ def create_contact(payload: ContactCreate, db: Session = Depends(get_db)) -> Con
     db.add(ContactStatusHistory(request_id=item.id, from_status=None, to_status=ContactStatus.NUEVA))
     db.commit()
     db.refresh(item)
+    background_tasks.add_task(
+        send_contact_notification,
+        ContactNotification(
+            id=item.id,
+            nombre=item.nombre,
+            email=item.email,
+            telefono=item.telefono,
+            mensaje=item.mensaje,
+            created_at=item.created_at,
+        ),
+    )
     return item
 
 
