@@ -9,14 +9,30 @@ on:
 jobs:
   build-and-check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: contact_test
+          POSTGRES_PASSWORD: contact_test
+          POSTGRES_DB: gr_contact_test_db
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U contact_test -d gr_contact_test_db"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://contact_test:contact_test@localhost:5432/gr_contact_test_db
+      JWT_SECRET: local-development-secret-change-me
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
           cache: pip
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements-dev.txt
       - run: python -m compileall -q app migrations
+      - run: alembic upgrade head
+      - run: pytest -q tests
       - run: docker build -t gr-contact-microservice:ci .
 
   release:
