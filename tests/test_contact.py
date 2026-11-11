@@ -6,7 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from app.main import JWT_SECRET, SessionLocal, app
+from app.jwe import encrypt_nested_jwt
+from app.main import JWT_ENCRYPTION_KEY, JWT_SECRET, SessionLocal, app
 
 
 @pytest.fixture(autouse=True)
@@ -18,10 +19,13 @@ def clean_database():
 
 
 def token(roles: list[str]) -> str:
-    return jwt.encode(
-        {"uid": 1, "roles": roles, "exp": datetime.now(UTC) + timedelta(hours=1)},
-        JWT_SECRET,
-        algorithm="HS256",
+    return encrypt_nested_jwt(
+        jwt.encode(
+            {"uid": 1, "roles": roles, "exp": datetime.now(UTC) + timedelta(hours=1)},
+            JWT_SECRET,
+            algorithm="HS256",
+        ),
+        JWT_ENCRYPTION_KEY,
     )
 
 
@@ -78,3 +82,15 @@ def test_admin_inbox_requires_role_and_csrf_for_status_change():
     assert response.json()["status"] == "EN_REVISION"
     with SessionLocal() as db:
         assert db.scalar(text("SELECT count(*) FROM contact_status_history")) == 2
+
+
+def test_a_signed_but_unencrypted_token_is_rejected():
+    plain = jwt.encode(
+        {"uid": 1, "roles": ["ADMINISTRACION"], "exp": datetime.now(UTC) + timedelta(hours=1)},
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+
+    response = TestClient(app).get("/api/v1/contacto/solicitudes", cookies={"access_token": plain})
+
+    assert response.status_code == 401
