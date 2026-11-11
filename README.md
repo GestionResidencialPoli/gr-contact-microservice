@@ -8,7 +8,7 @@ API FastAPI para solicitudes públicas de contacto y su gestión por administrac
 - `POST /api/v1/contacto/solicitudes` es público; requiere consentimiento explícito y guarda su versión, fecha y el historial de estado.
 - `GET /api/v1/contacto/solicitudes[?status=...]`, `GET /api/v1/contacto/solicitudes/{id}` y `PATCH /api/v1/contacto/solicitudes/{id}/estado` requieren cookie `access_token` con rol `ADMINISTRACION`; las escrituras requieren `X-XSRF-TOKEN` igual a la cookie `XSRF-TOKEN`.
 
-La aplicación se ejecuta en el puerto 4500. Configura `DATABASE_URL`, el mismo `JWT_SECRET` de Identidad y `CORS_ALLOWED_ORIGINS` según `.env.example`. No se almacena la IP del visitante.
+La aplicación se ejecuta en el puerto 4500. Configura `DATABASE_URL`, el mismo `JWT_SECRET` y la misma `JWT_ENCRYPTION_KEY` de Identidad (el access token es un JWS cifrado como JWE `dir` + `A256GCM`; `app/jwe.py` lo descifra antes de verificar la firma y un JWT sin cifrar se rechaza) y `CORS_ALLOWED_ORIGINS` según `.env.example`. No se almacena la IP del visitante.
 
 ## Notificación por correo
 

@@ -14,10 +14,12 @@ from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, select
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
+from app.jwe import InvalidEncryptedToken, decrypt_nested_jwt, load_encryption_key
 from app.mailer import ContactNotification, send_contact_notification
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://gr_user:gr_password@localhost:5432/gr_contact_db")
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
+JWT_ENCRYPTION_KEY = load_encryption_key()
 
 
 class Base(DeclarativeBase):
@@ -112,8 +114,8 @@ def current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail={"code": "NO_AUTENTICADO", "message": "Sesión requerida"})
     try:
-        claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.PyJWTError as exc:
+        claims = jwt.decode(decrypt_nested_jwt(token, JWT_ENCRYPTION_KEY), JWT_SECRET, algorithms=["HS256"])
+    except (jwt.PyJWTError, InvalidEncryptedToken) as exc:
         raise HTTPException(status_code=401, detail={"code": "NO_AUTENTICADO", "message": "Sesión inválida"}) from exc
     if "ADMINISTRACION" not in claims.get("roles", []):
         raise HTTPException(status_code=403, detail={"code": "SIN_PERMISOS", "message": "Se requiere administración"})
