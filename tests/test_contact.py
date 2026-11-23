@@ -6,6 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from app import main as contact
+from app.communications import CommunicationsError
 from app.jwe import encrypt_nested_jwt
 from app.main import JWT_ENCRYPTION_KEY, JWT_SECRET, SessionLocal, app
 
@@ -94,3 +96,22 @@ def test_a_signed_but_unencrypted_token_is_rejected():
     response = TestClient(app).get("/api/v1/contacto/solicitudes", cookies={"access_token": plain})
 
     assert response.status_code == 401
+
+
+def test_new_request_notifies_the_administration(monkeypatch):
+    events = []
+    monkeypatch.setattr(contact.communications, "emit", lambda *event: events.append(event))
+
+    response = TestClient(app).post("/api/v1/contacto/solicitudes", json=create_payload())
+
+    assert response.status_code == 201
+    assert events == [("contacto.creado", {"roles": ["ADMINISTRACION"]}, {"id": response.json()["id"]})]
+
+
+def test_request_is_saved_when_the_hub_is_unavailable(monkeypatch):
+    def unavailable(*_):
+        raise CommunicationsError("HUB_NO_DISPONIBLE", "sin conexión")
+
+    monkeypatch.setattr(contact.communications, "emit", unavailable)
+
+    assert TestClient(app).post("/api/v1/contacto/solicitudes", json=create_payload()).status_code == 201

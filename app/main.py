@@ -1,6 +1,8 @@
 import hmac
+import logging
 import os
 from collections.abc import Generator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from enum import Enum
 
@@ -14,12 +16,16 @@ from sqlalchemy import DateTime, ForeignKey, String, Text, create_engine, select
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
+from app.communications import CommunicationsError, communications_client
 from app.jwe import InvalidEncryptedToken, decrypt_nested_jwt, load_encryption_key
 from app.mailer import ContactNotification, send_contact_notification
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://gr_user:gr_password@localhost:5432/gr_contact_db")
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
 JWT_ENCRYPTION_KEY = load_encryption_key()
+
+logger = logging.getLogger("gr.contact")
+communications = communications_client("contact-microservice")
 
 
 class Base(DeclarativeBase):
@@ -129,7 +135,16 @@ def require_csrf(request: Request) -> None:
         raise HTTPException(status_code=403, detail={"code": "CSRF_INVALIDO", "message": "Token CSRF inválido"})
 
 
-app = FastAPI(title="GR Contact Microservice", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    communications.start()
+    try:
+        yield
+    finally:
+        communications.stop()
+
+
+app = FastAPI(title="GR Contact Microservice", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3006,http://localhost:3001").split(","),
@@ -167,6 +182,13 @@ def readiness(db: Session = Depends(get_db)) -> dict[str, str]:
     return {"status": "ready"}
 
 
+def notify_new_request(request_id: int) -> None:
+    try:
+        communications.emit("contacto.creado", {"roles": ["ADMINISTRACION"]}, {"id": request_id})
+    except CommunicationsError as exc:
+        logger.warning("No se pudo notificar la solicitud %s: %s", request_id, exc)
+
+
 @app.post("/api/v1/contacto/solicitudes", response_model=ContactResponse, status_code=status.HTTP_201_CREATED)
 def create_contact(
     payload: ContactCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)
@@ -193,6 +215,7 @@ def create_contact(
     db.add(ContactStatusHistory(request_id=item.id, from_status=None, to_status=ContactStatus.NUEVA))
     db.commit()
     db.refresh(item)
+    background_tasks.add_task(notify_new_request, item.id)
     background_tasks.add_task(
         send_contact_notification,
         ContactNotification(
